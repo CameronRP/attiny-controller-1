@@ -36,6 +36,8 @@ nfpms:
       dst: /usr/bin/stay-on-for
     - src: _release/10-notify-attiny
       dst: /lib/dhcpcd/dhcpcd-hooks/10-notify-attiny
+    - src: _release/attiny-firmware.hex
+      dst: /etc/cacophony/attiny-firmware.hex
   scripts:
     postinstall: "_release/postinstall.sh"
 

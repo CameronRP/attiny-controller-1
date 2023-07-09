@@ -19,22 +19,15 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"log"
-	"os"
 	"os/exec"
-	"runtime"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/TheCacophonyProject/event-reporter/v3/eventclient"
 	"github.com/TheCacophonyProject/go-config"
 	arg "github.com/alexflint/go-arg"
-	linuxproc "github.com/c9s/goprocinfo/linux"
-	"golang.org/x/sys/unix"
+	"periph.io/x/conn/v3/i2c"
 )
 
 // How long to wait before checking the recording window. This
@@ -54,64 +47,6 @@ var (
 	stayOnUntil        = time.Now()
 	saltCommandWaitEnd = time.Time{}
 )
-
-func shouldTurnOff(minutesUntilActive int) bool {
-	mu.Lock()
-	defer mu.Unlock()
-	turnOff := true
-	if time.Now().Before(stayOnUntil) {
-		turnOff = false
-	} else if minutesUntilActive < 15 {
-		turnOff = false
-	}
-	if !turnOff {
-		saltCommandWaitEnd = time.Time{} // Not waiting for salt command
-		return false
-	}
-	return !shouldStayOnForSalt()
-}
-
-// shouldStayOnForSalt will check if a salt command is running via checking the output from `salt-call saltutil.running`
-// If a device is being kept on for too long because of salt commands it will ignore the salt command check.
-func shouldStayOnForSalt() bool {
-	if saltCommandWaitEnd.IsZero() {
-		saltCommandWaitEnd = time.Now().Add(saltCommandWaitDuration)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	stdout, err := exec.CommandContext(ctx, "salt-call", "--local", "saltutil.running").Output()
-	if err != nil {
-		log.Println(err)
-		return false
-	}
-
-	strOut := string(stdout)
-	if strings.Count(strOut, "\n") <= 2 { // If a salt command is running the output will have much more than 2 lines.
-		return false
-	}
-
-	if time.Now().After(saltCommandWaitEnd) {
-		log.Printf("waiting for salt command for too long (%v)", saltCommandWaitDuration)
-		log.Printf("salt command:\n%v", strOut)
-		return false
-	}
-	log.Println("staying on for salt command to finish")
-	return true
-}
-
-func setStayOnUntil(newTime time.Time) error {
-	if time.Until(newTime) > 12*time.Hour {
-		return errors.New("can not delay over 12 hours")
-	}
-	mu.Lock()
-	if stayOnUntil.Before(newTime) {
-		stayOnUntil = newTime
-	}
-	mu.Unlock()
-	log.Println("staying on until", stayOnUntil.Format(time.UnixDate))
-	return nil
-}
 
 type Args struct {
 	ConfigDir          string `arg:"-c,--config" help:"configuration folder"`
@@ -138,7 +73,7 @@ func main() {
 		log.Fatal(err)
 	}
 	// If no error then keep the background goroutines running.
-	runtime.Goexit()
+	//runtime.Goexit()
 }
 
 func runMain() error {
@@ -152,176 +87,123 @@ func runMain() error {
 
 	conf, err := ParseConfig(args.ConfigDir)
 	if err != nil {
-		log.Printf("error parsing config: %s\nwill try to just ping watchdog", err)
-		return justPingWatchdog()
+		return err
 	}
 
-	log.Println("connecting to attiny")
-	attiny, err := connectATtiny(conf.Battery)
+	log.Println("Connecting to ATtiny1616")
+	attiny, err := connectToATtinyWithRetries(0)
 	if err != nil {
 		return err
 	}
-	if attiny == nil {
-		log.Println("attiny not present")
-		return nil
-	}
-	log.Println("connected to attiny")
 
-	if onBattery, err := attiny.checkIsOnBattery(); err != nil {
-		log.Println(err.Error())
-	} else if onBattery {
-		log.Println("on battery power")
+	log.Println("Setting up WDT pinging")
+	go func() {
+		for {
+			attiny.PingWatchdog()
+			time.Sleep(time.Second * 5)
+		}
+	}()
+
+	log.Println("Connecting to RTC")
+	rtc, err := InitPCF9564()
+	if err != nil {
+		return err
+	}
+
+	if err := attiny.ReadCameraState(); err != nil {
+		return err
+	}
+
+	if err := rtc.ClearAlarmFlag(); err != nil {
+		return err
+	}
+
+	// TODO write time to RTC if have synced with internet time thing
+	//if err := rtc.SetTime(time.Now()); err != nil {
+	//	return err
+	//}
+
+	t, err := rtc.GetTime()
+	if err != nil {
+		return err
+	}
+	log.Println("RTC time:", t.Format(time.RFC3339))
+
+	alarmTime := conf.OnWindow.NextStart()
+	log.Println("Alarm time:", alarmTime.Format(time.RFC3339))
+
+	if err := rtc.SetAlarmTime(AlarmTimeFromTime(alarmTime)); err != nil {
+		return err
+	}
+
+	if err := rtc.SetAlarmEnabled(true); err != nil {
+		return err
+	}
+
+	attiny.ReadCameraState()
+	log.Println(attiny.CameraState)
+
+	if args.SkipWait {
+		log.Println("Not waiting initial grace period.")
 	} else {
-		log.Println("not on battery")
+		log.Println("Waiting 20 minutes before checking for power off.")
+		time.Sleep(20 * time.Minute)
 	}
 
-	log.Println("starting D-Bus service")
-	if err := startService(attiny); err != nil {
+	// Wait for next power off time if in active window or if window is going to starts in the next 5 minutes
+	if conf.OnWindow.Active() || time.Until(conf.OnWindow.NextStart()) < time.Minute*2 {
+		delayDuration := time.Until(conf.OnWindow.NextEnd())
+		log.Printf("Sleeping for %v until turning off", delayDuration)
+		time.Sleep(delayDuration)
+		log.Println("Finished waiting for power off")
+		attiny.ReadCameraState()
+		log.Println(attiny.CameraState)
+	}
+
+	attiny.ReadCameraState()
+	log.Println(attiny.CameraState)
+	if err := attiny.PoweringOff(); err != nil {
 		return err
 	}
-	log.Println("started D-Bus service")
-	sendingHeartBeats := true
-	go heartBeatLoop(conf.OnWindow)
-	go updateWatchdogTimer(attiny)
-	if err := attiny.UpdateWifiState(); err != nil {
-		log.Println("failed to update wifi state:", err)
-	}
-
-	if conf.Battery.EnableVoltageReadings {
-		go batteryLoop(attiny)
-	}
-
-	log.Printf("on window: %s", conf.OnWindow)
-
-	if conf.OnWindow.NoWindow {
-		log.Printf("no window so pinging watchdog only")
-		runtime.Goexit()
-	}
-
-	if !args.SkipWait {
-		log.Printf("waiting for %s before applying recording window", initialGracePeriod)
-		time.Sleep(initialGracePeriod)
-	}
-
-	for {
-		if conf.OnWindow.Active() {
-			if !sendingHeartBeats {
-				// means pi hasnt reboot and we need to start a new heartbeat loop
-				sendingHeartBeats = true
-				go heartBeatLoop(conf.OnWindow)
-			}
-			untilEnd := conf.OnWindow.UntilEnd()
-			log.Printf("%s until on window ends", untilEnd)
-			log.Println("sleeping until end of window")
-			time.Sleep(untilEnd - 3*time.Minute)
-			log.Println("making daytime-power-off event")
-			eventclient.AddEvent(eventclient.Event{
-				Timestamp: time.Now(),
-				Type:      "daytime-power-off",
-				Details: map[string]interface{}{
-					"powerOnAt": conf.OnWindow.NextStart(),
-				},
-			})
-			sendFinalHeartBeat(conf.OnWindow)
-			eventclient.UploadEvents() //Try to upload events before shutdown
-			time.Sleep(3 * time.Minute)
-			sendingHeartBeats = false
-		} else {
-			minutesUntilActive := int(conf.OnWindow.Until().Minutes())
-			log.Printf("minutes until active %d", minutesUntilActive)
-			if shouldTurnOff(minutesUntilActive) {
-				log.Println("syncing filesystems...")
-				unix.Sync()
-
-				log.Println("requesting power off...")
-				if err := attiny.PowerOff(minutesUntilActive - 2); err != nil {
-					log.Fatal(err)
-				}
-				log.Println("power off requested")
-
-				if !args.SkipSystemShutdown {
-					log.Println("shutting down system...")
-					if err := shutdown(); err != nil {
-						log.Fatal(err)
-					}
-				}
-			}
-			time.Sleep(time.Minute)
-		}
-	}
+	attiny.ReadCameraState()
+	log.Println(attiny.CameraState)
+	shutdown()
+	return nil
 }
 
-func updateWatchdogTimer(a *attiny) {
-	log.Println("sending watchdog timer updates")
-	for {
-		if err := a.PingWatchdog(); err != nil {
-			log.Fatal(err)
-		}
-		time.Sleep(time.Minute)
-	}
+func fromBCD(b byte) int {
+	return int(b&0x0F) + int(b>>4)*10
 }
 
-func batteryLoop(a *attiny) {
-	for {
-		cpu, err := cpuUsage()
-		if err != nil {
-			log.Printf("error with getting cpu usage: %s", err)
-			return
-		}
-		batteryVal, err := a.readBatteryValue()
-		nowStr := time.Now().Format("2006-01-02 15:04:05")
-		dataStr := fmt.Sprintf("%s, %f, %d\n", nowStr, cpu, batteryVal)
-		if err := appendToFile(dataStr, batteryCSVFile); err != nil {
-			log.Printf("error logging battery value: %s", err)
-			return
-		}
-		time.Sleep(batteryReadingInterval)
-	}
+// readBytes reads bytes from the I2C device starting from a given register.
+func readBytes(dev *i2c.Dev, register byte, data []byte) error {
+	return dev.Tx([]byte{register}, data)
 }
 
-func cpuUsage() (float64, error) {
-	stat1, err := linuxproc.ReadStat(systemStatFile)
-	if err != nil {
+// readByte reads a byte from the I2C device from a given register.
+func readByte(dev *i2c.Dev, register byte) (byte, error) {
+	data := make([]byte, 1)
+	if err := dev.Tx([]byte{register}, data); err != nil {
 		return 0, err
 	}
-	time.Sleep(3 * time.Second)
-	stat2, err := linuxproc.ReadStat(systemStatFile)
-	if err != nil {
-		return 0, err
-	}
-	if len(stat1.CPUStats) != len(stat1.CPUStats) {
-		return 0, errors.New("bad stat file readings")
-	}
-	var cpuTotal float64
-	for i := 0; i < len(stat1.CPUStats); i++ {
-		cpu1 := stat1.CPUStats[i]
-		cpu2 := stat2.CPUStats[i]
-
-		total1, idle1 := getTotalAndIdleTicks(&cpu1)
-		total2, idle2 := getTotalAndIdleTicks(&cpu2)
-
-		totalDiff := total2 - total1
-		idleDiff := idle2 - idle1
-		cpu := float64(totalDiff-idleDiff) / float64(totalDiff)
-		cpuTotal += cpu
-	}
-	return cpuTotal / float64(len(stat1.CPUStats)), nil
+	return data[0], nil
 }
 
-func appendToFile(text string, file string) error {
-	f, err := os.OpenFile(file, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = f.WriteString(text)
+// writeByte writes a byte to the I2C device at a given register.
+func writeByte(dev *i2c.Dev, register byte, data byte) error {
+	_, err := dev.Write([]byte{register, data})
 	return err
 }
 
-func getTotalAndIdleTicks(c *linuxproc.CPUStat) (total, idle uint64) {
-	idle = c.IOWait + c.Idle
-	total = idle + c.User + c.Nice + c.System + c.IRQ + c.SoftIRQ + c.Steal
-	return total, idle
+// toBCD converts a decimal number to binary-coded decimal.
+func toBCD(n int) byte {
+	return byte(n)/10<<4 + byte(n)%10
+}
+
+// writeBytes writes the given bytes to the I2C device.
+func writeBytes(dev *i2c.Dev, data []byte) error {
+	_, err := dev.Write(data)
+	return err
 }
 
 func shutdown() error {
@@ -330,19 +212,5 @@ func shutdown() error {
 	if err != nil {
 		return fmt.Errorf("poweroff failed: %v\n%s", err, output)
 	}
-	return nil
-}
-
-func justPingWatchdog() error {
-	attiny, err := connectATtiny(config.Battery{})
-	if err != nil {
-		return err
-	}
-	if attiny == nil {
-		log.Println("attiny not present")
-		return nil
-	}
-	log.Println("connected to attiny")
-	go updateWatchdogTimer(attiny)
 	return nil
 }

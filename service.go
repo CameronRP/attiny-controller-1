@@ -21,7 +21,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/godbus/dbus"
 	"github.com/godbus/dbus/introspect"
@@ -74,35 +73,11 @@ func (s service) IsPresent() (bool, *dbus.Error) {
 
 // StayOnFor will delay turning off the raspberry pi for m minutes.
 func (s service) StayOnFor(m int) *dbus.Error {
-	err := setStayOnUntil(time.Now().Add(time.Duration(m) * time.Minute))
-	if err != nil {
-		return makeDbusError(".StayOnForError", err)
-	}
+	//err := setStayOnUntil(time.Now().Add(time.Duration(m) * time.Minute))
+	//if err != nil {
+	//	return makeDbusError(".StayOnForError", err)
+	//}
 	return nil
-}
-
-// ReadBatteryPin will return the analog battery sense pin value on the attiny
-func (s service) ReadBatteryPin() (uint16, *dbus.Error) {
-	if err := s.ensureATtinyPresent(); err != nil {
-		return 0, makeDbusError(".ReadBatteryPin", err)
-	}
-	bat, err := s.attiny.readBatteryValue()
-	if err != nil {
-		return 0, makeDbusError(".ReadBatteryPin", err)
-	}
-	return bat, nil
-}
-
-// OnBattery will return true when the input voltage is higher than 5.5V
-func (s service) OnBattery() (bool, *dbus.Error) {
-	if err := s.ensureATtinyPresent(); err != nil {
-		return false, makeDbusError(".OnBattery", err)
-	}
-	onBattery, err := s.attiny.checkIsOnBattery()
-	if err != nil {
-		return false, makeDbusError(".OnBattery", err)
-	}
-	return onBattery, nil
 }
 
 func (s service) UpdateWifiState() *dbus.Error {
